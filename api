@@ -1,0 +1,53 @@
+<?php
+declare(strict_types=1);
+if(session_status()!==PHP_SESSION_ACTIVE){ini_set('session.cookie_httponly','1');ini_set('session.cookie_samesite','Strict');ini_set('session.use_strict_mode','1');session_start();}
+header('X-Content-Type-Options: nosniff');header('Referrer-Policy: same-origin');header('X-Frame-Options: DENY');
+$privateDir=dirname(__DIR__).'/private';if(!is_dir($privateDir))mkdir($privateDir,0700,true);if(!is_dir($privateDir.'/users'))mkdir($privateDir.'/users',0700,true);
+function users_path():string{return dirname(__DIR__).'/private/users.json';}
+function all_users():array{$p=users_path();if(!is_file($p))return []; $v=json_decode((string)file_get_contents($p),true);return is_array($v)?$v:[];}
+function save_users(array $u):void{$p=users_path();$tmp=$p.'.tmp';file_put_contents($tmp,json_encode($u,JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT),LOCK_EX);@chmod($tmp,0600);rename($tmp,$p);@chmod($p,0600);}
+function current_uid():string{return preg_match('/^[a-f0-9]{32}$/',(string)($_SESSION['uid']??''))?(string)$_SESSION['uid']:'';}
+function user_dir(?string $uid=null):string{$id=$uid??current_uid();if(!preg_match('/^[a-f0-9]{32}$/',$id))throw new RuntimeException('شناسه کاربر معتبر نیست.');$d=dirname(__DIR__).'/private/users/'.$id;if(!is_dir($d))mkdir($d,0700,true);return $d;}
+function cfg_path():string{return user_dir().'/config.json';}
+function queue_path():string{return user_dir().'/queue.json';}
+function logs_path():string{return user_dir().'/logs.json';}
+function secret_key():string{
+    $p=dirname(__DIR__).'/private/master.key';
+    if(!is_file($p)){
+        $key=random_bytes(SODIUM_CRYPTO_SECRETBOX_KEYBYTES);
+        $fh=fopen($p,'x');
+        if($fh){fwrite($fh,$key);fclose($fh);@chmod($p,0600);}
+    }
+    $key=is_file($p)?file_get_contents($p):false;
+    if(!is_string($key)||strlen($key)!==SODIUM_CRYPTO_SECRETBOX_KEYBYTES)throw new RuntimeException('کلید رمزنگاری سرور در دسترس نیست.');
+    return $key;
+}
+function load_config():array{
+    $p=cfg_path();if(!is_file($p))return [];
+    $v=json_decode((string)file_get_contents($p),true);if(!is_array($v))return [];
+    if(($v['_encrypted']??false)===true){
+        $raw=base64_decode((string)($v['payload']??''),true);if($raw===false||strlen($raw)<=SODIUM_CRYPTO_SECRETBOX_NONCEBYTES)return [];
+        $nonce=substr($raw,0,SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);$plain=sodium_crypto_secretbox_open(substr($raw,SODIUM_CRYPTO_SECRETBOX_NONCEBYTES),$nonce,secret_key());
+        if($plain===false)throw new RuntimeException('رمزگشایی تنظیمات انجام نشد؛ فایل کلید سرور را بررسی کن.');
+        $data=json_decode($plain,true);return is_array($data)?$data:[];
+    }
+    // Migrate existing plaintext config to encrypted storage on the next save.
+    return $v;
+}
+function save_config(array $c):void{
+    $p=cfg_path();$nonce=random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);$cipher=sodium_crypto_secretbox(json_encode($c,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES),$nonce,secret_key());
+    $stored=['_encrypted'=>true,'payload'=>base64_encode($nonce.$cipher)];$tmp=$p.'.tmp';
+    if(file_put_contents($tmp,json_encode($stored,JSON_PRETTY_PRINT),LOCK_EX)===false)throw new RuntimeException('ذخیره تنظیمات ناموفق بود.');
+    @chmod($tmp,0600);if(!rename($tmp,$p))throw new RuntimeException('ثبت نهایی تنظیمات ناموفق بود.');@chmod($p,0600);
+}
+function is_logged_in():bool{return current_uid()!=='';}
+function require_login():void{if(!is_logged_in()){header('Location: login.php');exit;}}
+function csrf_token():string{if(empty($_SESSION['csrf']))$_SESSION['csrf']=bin2hex(random_bytes(32));return $_SESSION['csrf'];}
+function check_csrf_post():void{$v=$_POST['csrf']??$_SERVER['HTTP_X_CSRF_TOKEN']??'';if(empty($_SESSION['csrf'])||!hash_equals($_SESSION['csrf'],(string)$v)){http_response_code(403);exit('درخواست نامعتبر است. صفحه را تازه‌سازی کن.');}}
+function json_input():array{$x=json_decode((string)file_get_contents('php://input'),true);return is_array($x)?$x:[];}
+function api_start():array{header('Content-Type: application/json; charset=utf-8');if($_SERVER['REQUEST_METHOD']!=='POST')json_out(['error'=>'روش درخواست مجاز نیست'],405);if(!is_logged_in())json_out(['error'=>'ابتدا وارد پنل شو'],401);check_csrf_post();return json_input();}
+function json_out(array $x,int $status=200):never{http_response_code($status);echo json_encode($x,JSON_UNESCAPED_UNICODE);exit;}
+function log_event(string $event,string $status='ok'):void{$p=logs_path();$a=is_file($p)?(json_decode((string)file_get_contents($p),true)?:[]):[];array_unshift($a,['time'=>date('c'),'event'=>$event,'status'=>$status]);$a=array_slice($a,0,100);file_put_contents($p,json_encode($a,JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT),LOCK_EX);@chmod($p,0600);}
+function http_json(string $url,array $headers,?array $payload=null):array{$ch=curl_init($url);$opts=[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>50,CURLOPT_CONNECTTIMEOUT=>15,CURLOPT_HTTPHEADER=>$headers,CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2];if($payload!==null){$opts[CURLOPT_POST]=true;$opts[CURLOPT_POSTFIELDS]=json_encode($payload,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);}curl_setopt_array($ch,$opts);$body=curl_exec($ch);$err=curl_error($ch);$code=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);if($body===false)throw new RuntimeException('خطای ارتباط: '.$err);$j=json_decode($body,true);if($code>=400)throw new RuntimeException(is_array($j)?($j['description']??$j['error']['message']??'خطای سرویس خارجی'):'خطای سرویس خارجی');if(!is_array($j))throw new RuntimeException('پاسخ نامعتبر از سرویس خارجی');return $j;}
+function bale_call(array $c,string $method,array $fields):array{if(empty($c['bale_token']))throw new RuntimeException('توکن ربات بله تنظیم نشده است.');$url='https://tapi.bale.ai/bot'.rawurlencode($c['bale_token']).'/'.$method;return http_json($url,['Content-Type: application/json'],$fields);}
+function ai_chat(array $c,array $messages):string{if(empty($c['ai_key'])||empty($c['ai_base'])||empty($c['ai_model']))throw new RuntimeException('تنظیمات هوش مصنوعی کامل نیست.');$base=rtrim($c['ai_base'],'/');if(!preg_match('~^https://~i',$base))throw new RuntimeException('آدرس API باید HTTPS باشد.');$r=http_json($base.'/chat/completions',['Authorization: Bearer '.$c['ai_key'],'Content-Type: application/json'],['model'=>$c['ai_model'],'temperature'=>0.35,'messages'=>$messages]);$v=$r['choices'][0]['message']['content']??'';if(!is_string($v)||$v==='')throw new RuntimeException('پاسخ هوش مصنوعی خالی بود.');return $v;}
